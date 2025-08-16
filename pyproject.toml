@@ -1,0 +1,25 @@
+
+[project]
+name = "devopsys"
+version = "0.4.0"
+description = "Neuro-DevOps agent with FastAPI, Telegram bot, SAFE/UNSAFE, monitoring, LangChain."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name="devopsys"}]
+dependencies = [
+    "click>=8.1",
+    "requests>=2.31",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+web = ["fastapi>=0.110", "uvicorn>=0.23"]
+agents = ["langchain>=0.2", "langchain-openai>=0.1.0"]
+all = ["fastapi>=0.110", "uvicorn>=0.23", "langchain>=0.2", "langchain-openai>=0.1.0"]
+
+[project.scripts]
+devopsys = "devopsys.main:cli_main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
