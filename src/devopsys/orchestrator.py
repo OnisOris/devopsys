@@ -263,6 +263,19 @@ class MultiAgentOrchestrator:
         last_outcome: dict | None = None
 
         task_lc = (task or "").lower()
+        gpu_refinement_hint = (
+            "When gathering GPU utilisation, call subprocess.run("
+            "['nvidia-smi', '--query-gpu=utilization.gpu', "
+            "'--format=csv,noheader,nounits'], capture_output=True, text=True, check=False) without shell=True. "
+            "Gracefully handle FileNotFoundError or non-zero return codes by printing a clear message "
+            "and exiting cleanly (use sys.exit(0) after the message). "
+            "Provide one line per GPU with its utilisation or an informative fallback when data is unavailable."
+        )
+        directory_refinement_hint = (
+            "List directories via os.scandir(path) filtered with entry.is_dir(). "
+            "Expose an argparse --path argument defaulting to '.', sort the resulting folder names, "
+            "and print them one per line."
+        )
         dynamic_max_attempts = 8 if ("matplotlib" in task_lc) else max_attempts
 
         for attempt_idx in range(1, dynamic_max_attempts + 1):
@@ -315,6 +328,24 @@ class MultiAgentOrchestrator:
             )
             refined_parts.append("Regenerate from scratch. Output ONLY Python code (no markdown/prose).")
             refined_parts.append("Use only the standard library unless explicitly requested.")
+
+            reason_lc = reason.lower() if isinstance(reason, str) else ""
+            combined_missing = " ".join(missing_list).lower()
+
+            needs_gpu_hint = any(
+                key in value
+                for value in (task_lc, reason_lc, combined_missing)
+                for key in ("gpu", "nvidia-smi", "cuda")
+            )
+            if needs_gpu_hint and not any("nvidia-smi" in part.lower() for part in refined_parts):
+                refined_parts.append(gpu_refinement_hint)
+
+            dir_keywords = ("directory", "directories", "folder", "folders")
+            needs_directory_hint = any(keyword in task_lc for keyword in dir_keywords) or any(
+                keyword in value for value in (reason_lc, combined_missing) for keyword in dir_keywords
+            )
+            if needs_directory_hint and not any("scandir" in part.lower() for part in refined_parts):
+                refined_parts.append(directory_refinement_hint)
             refined_instruction = "\n".join(part.strip() for part in refined_parts if part.strip()) + "\n"
 
             agent_model = self.agent_model_factories.get("python", self.model_factory)()
@@ -398,12 +429,6 @@ class MultiAgentOrchestrator:
         if len(executions) == 1:
             return executions[0].result
 
-        # Prefer the last file result that passes our static audit (for python).
-        for exec_step in reversed(executions):
-            if exec_step.result.filename and exec_step.step.agent == "python":
-                ok, _reason, _missing, _meta = self._static_python_audit(task, exec_step.result.text)
-                if ok:
-                    return AgentResult(text=exec_step.result.text, filename=exec_step.result.filename)
         # Compliance-gated finalize: prefer last verifier verdict
         def _parse_verdict(raw: str) -> dict:
             txt = (raw or "").strip()
@@ -416,28 +441,27 @@ class MultiAgentOrchestrator:
             except Exception:
                 return {}
 
-        last_verifier_idx = None
+        last_verifier_idx: int | None = None
         for idx in range(len(executions) - 1, -1, -1):
             if executions[idx].step.agent == "verifier":
                 last_verifier_idx = idx
                 break
 
         if last_verifier_idx is not None:
-            verdict = _parse_verdict(executions[last_verifier_idx].result.text)
+            verifier_result = executions[last_verifier_idx].result
+            verdict = _parse_verdict(verifier_result.text)
             if verdict.get("ok") is True:
                 for j in range(last_verifier_idx - 1, -1, -1):
-                    if executions[j].step.agent == "python" and executions[j].result.filename:
-                        return AgentResult(text=executions[j].result.text, filename=executions[j].result.filename)
-                for j in range(last_verifier_idx - 1, -1, -1):
                     if executions[j].step.agent == "python":
-                        return AgentResult(text=executions[j].result.text)
-            else:
-                return AgentResult(text=executions[last_verifier_idx].result.text)
+                        python_result = executions[j].result
+                        if python_result.filename:
+                            return AgentResult(text=python_result.text, filename=python_result.filename)
+                        return AgentResult(text=python_result.text)
+            return AgentResult(text=verifier_result.text)
 
-        # Otherwise, return the last python file result produced as text only (do not save invalid code).
         for exec_step in reversed(executions):
-            if exec_step.step.agent == "python" and exec_step.result.filename:
-                return AgentResult(text=exec_step.result.text, filename=None)
+            if exec_step.step.agent == "python":
+                return AgentResult(text=exec_step.result.text)
 
         sections = []
         for exec_step in executions:

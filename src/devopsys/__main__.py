@@ -6,12 +6,14 @@ from typing import Callable
 
 import click
 import httpx
+from click.core import ParameterSource
 from rich.console import Console
 
 from .agents.registry import AGENT_REGISTRY
 from .models.base import Model
 from .models.dummy import DummyModel
 from .models.ollama import OllamaModel
+from .models.openai import OpenAIModel
 from .ollama import list_models, pull_model
 from .orchestrator import MultiAgentOrchestrator
 from .run_logger import RunLogger, NullRunLogger
@@ -19,7 +21,12 @@ from .settings import settings
 
 console = Console()
 
-BACKENDS = {"dummy": DummyModel, "ollama": OllamaModel}
+BACKENDS = {
+    "dummy": DummyModel,
+    "ollama": OllamaModel,
+    "openai": OpenAIModel,
+    "deepseek": OpenAIModel,
+}
 
 
 def _make_model_factory(
@@ -43,6 +50,46 @@ def _make_model_factory(
             )
 
         return _factory
+    if backend == "openai":
+        api_key = settings.openai_api_key.strip()
+        if not api_key:
+            raise click.ClickException("OpenAI backend requires DEVOPSYS_OPENAI_API_KEY")
+        base_url = (settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+        chosen_model = model_name or settings.openai_model
+        system_prompt = settings.openai_system_prompt
+
+        def _factory() -> Model:
+            return OpenAIModel(
+                api_key=api_key,
+                model=chosen_model,
+                base_url=base_url,
+                temperature=settings.temperature,
+                max_tokens=settings.max_tokens,
+                timeout=settings.openai_timeout,
+                system_prompt=system_prompt,
+            )
+
+        return _factory
+    if backend == "deepseek":
+        api_key = settings.deepseek_api_key.strip()
+        if not api_key:
+            raise click.ClickException("DeepSeek backend requires DEVOPSYS_DEEPSEEK_API_KEY")
+        base_url = (settings.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
+        chosen_model = model_name or settings.deepseek_model
+        system_prompt = settings.deepseek_system_prompt or settings.openai_system_prompt
+
+        def _factory() -> Model:
+            return OpenAIModel(
+                api_key=api_key,
+                model=chosen_model,
+                base_url=base_url,
+                temperature=settings.temperature,
+                max_tokens=settings.max_tokens,
+                timeout=settings.deepseek_timeout,
+                system_prompt=system_prompt,
+            )
+
+        return _factory
     raise click.ClickException(f"Unknown backend: {backend}")
 
 
@@ -55,8 +102,16 @@ def _ensure_out_dir(path: str | None) -> None:
 
 @click.group()
 @click.version_option()
-@click.option("--backend", default=lambda: settings.backend, help="Model backend: ollama|dummy")
-@click.option("--model", default=lambda: settings.model, help="Model name (e.g., codellama:7b-instruct)")
+@click.option(
+    "--backend",
+    default=lambda: settings.backend,
+    help="Model backend: ollama|dummy|openai|deepseek",
+)
+@click.option(
+    "--model",
+    default=lambda: settings.model,
+    help="Model name for the selected backend (e.g., codellama:7b-instruct or gpt-4o-mini)",
+)
 @click.option(
     "--ollama-host",
     default=lambda: settings.ollama_host,
@@ -68,7 +123,14 @@ def cli_main(ctx: click.Context, backend: str, model: str, ollama_host: str) -> 
     """devopsys — локальный DevOps-ассистент (CLI)."""
     ctx.ensure_object(dict)
     ctx.obj["backend"] = backend
-    ctx.obj["model"] = model
+    model_source = ctx.get_parameter_source("model")
+    effective_model = model
+    if model_source == ParameterSource.DEFAULT:
+        if backend == "openai":
+            effective_model = settings.openai_model
+        elif backend == "deepseek":
+            effective_model = settings.deepseek_model
+    ctx.obj["model"] = effective_model
     ctx.obj["ollama_host"] = ollama_host
 
 

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import json
+
 from .base import Agent, AgentResult
 from ..langchain_support import model_runnable
 from langchain_core.output_parsers import StrOutputParser
@@ -81,7 +83,9 @@ class VerifierAgent(Agent):
         self._debug_log(f"[agent:{self.name}] prompt:\n{self._snippet(rendered)}\n")
         raw = self.model.complete(rendered)
         self._debug_log(f"[agent:{self.name}] raw output:\n{self._snippet(raw)}\n")
-        return self.postprocess(raw)
+        outcome = self._build_outcome(raw, report, task)
+        final_text = json.dumps(outcome, ensure_ascii=False)
+        return self.postprocess(final_text)
 
     def _execute(self, code: str) -> ExecutionReport:
         if not code.strip():
@@ -130,3 +134,90 @@ class VerifierAgent(Agent):
 
     def postprocess(self, text: str) -> AgentResult:
         return AgentResult(text=text)
+
+    def _build_outcome(self, raw: str, report: ExecutionReport, task: str) -> dict:
+        text = (raw or "").strip()
+        extracted = text
+        if text:
+            import re
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if match:
+                extracted = match.group(0)
+        try:
+            data = json.loads(extracted)
+            if not isinstance(data, dict):
+                raise ValueError("verdict is not object")
+        except Exception:
+            data = {
+                "ok": False,
+                "reason": "verifier response not understood",
+                "missing": [],
+                "forbidden": [],
+                "suggested_prompt": "Regenerate the script to satisfy the task.",
+            }
+
+        reason = data.get("reason") or ""
+        if not isinstance(reason, str):
+            reason = str(reason)
+        missing = data.get("missing") or []
+        if not isinstance(missing, list):
+            missing = [str(missing)]
+        forbidden = data.get("forbidden") or []
+        if not isinstance(forbidden, list):
+            forbidden = [str(forbidden)]
+        suggested = data.get("suggested_prompt") or ""
+        if not isinstance(suggested, str):
+            suggested = str(suggested)
+        ok_raw = data.get("ok")
+        if isinstance(ok_raw, bool):
+            ok = ok_raw
+        elif isinstance(ok_raw, str):
+            ok = ok_raw.strip().lower() in {"true", "1", "yes"}
+        else:
+            ok = bool(ok_raw)
+
+        def _append_reason(msg: str) -> None:
+            nonlocal reason
+            if msg:
+                reason = f"{reason}; {msg}" if reason else msg
+
+        def _add_missing(msg: str) -> None:
+            if msg and msg not in missing:
+                missing.append(msg)
+
+        if not report.compilation_ok:
+            ok = False
+            _append_reason(report.compilation_error or "failed to compile")
+            _add_missing("return syntactically valid Python code")
+        if report.compilation_ok:
+            if report.returncode is None:
+                ok = False
+                _append_reason("script did not produce an exit code")
+                _add_missing("ensure the script runs to completion and exits with code 0")
+            elif report.returncode != 0:
+                ok = False
+                _append_reason(f"script exited with code {report.returncode}")
+                _add_missing("ensure the script completes successfully")
+
+        task_lc = (task or "").lower()
+        stderr_lc = report.stderr.lower()
+        if "gpu" in task_lc:
+            if report.returncode != 0:
+                _add_missing("handle unavailable GPU or missing nvidia-smi gracefully")
+            if ok and not report.stdout.strip():
+                ok = False
+                _append_reason("GPU output was empty")
+                _add_missing("print the current GPU usage when available")
+            if "nvidia-smi" in stderr_lc and any(hint in stderr_lc for hint in ("not found", "no such file")):
+                ok = False
+                _append_reason("nvidia-smi command is unavailable")
+                _add_missing("detect missing nvidia-smi and emit a friendly message without failing")
+
+        outcome = {
+            "ok": ok,
+            "reason": reason.strip(),
+            "missing": missing,
+            "forbidden": forbidden,
+            "suggested_prompt": suggested.strip() or "Regenerate the script to satisfy the task.",
+        }
+        return outcome
