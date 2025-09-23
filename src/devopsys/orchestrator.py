@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import itertools
+import shutil
+import subprocess
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Sequence, Optional
+from pathlib import Path
+from typing import Callable, Iterable, List, Sequence, Optional, Tuple
+
+import tomllib
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
@@ -16,6 +22,15 @@ from .models.dummy import DummyModel
 from .router import Router
 from .workspace import build_workspace_snapshot
 from .run_logger import NullRunLogger
+from .project_builder import (
+    ProjectSpec,
+    ProjectFileSpec,
+    select_agent_for_file,
+    build_instruction,
+    ensure_directory,
+    format_plan_context_for_agent,
+    summarize_created_files,
+)
 
 
 @dataclass
@@ -133,17 +148,23 @@ class MultiAgentOrchestrator:
         task: str,
         forced_agent: str | None = None,
         os_name: str | None = None,
+        project_root: str | Path | None = None,
     ) -> OrchestrationResult:
         planner_model = (self.planner_model_factory or self.model_factory)()
         planner = LeadAgent(planner_model)
         workspace_snapshot = build_workspace_snapshot()
         self.logger.on_start(task, workspace_snapshot)
 
+        base_project_root: Path | None = None
+        if project_root is not None:
+            base_project_root = Path(project_root).expanduser().resolve()
+
         if forced_agent:
             plan = [PlanStep(agent=forced_agent, instruction=task, reason="forced by user")]
         else:
             plan = planner.plan(task, workspace_snapshot)
             plan = self._prune_plan(plan, task)
+            plan = self._ensure_project_plan(task, plan)
 
         if not plan:
             plan = _fallback_plan(task)
@@ -151,6 +172,7 @@ class MultiAgentOrchestrator:
         self.logger.on_plan(plan)
 
         executions: List[StepExecution] = []
+        project_summary: AgentResult | None = None
         for step in plan:
             agent_cls = AGENT_REGISTRY.get(step.agent)
             if agent_cls is None:
@@ -169,6 +191,26 @@ class MultiAgentOrchestrator:
                 raise
             self.logger.on_agent_end(step, result)
             executions.append(StepExecution(step=step, result=result))
+
+            if step.agent == "project_architect":
+                project_steps, summary = self._execute_project_plan(
+                    architect_output=result,
+                    original_task=task,
+                    base_directory=base_project_root,
+                )
+                executions.extend(project_steps)
+                if summary:
+                    project_summary = summary
+                continue
+
+            if step.agent not in {"python", "verifier"}:
+                verifier_exec = self._invoke_verifier(
+                    task=task,
+                    code=result.text,
+                    reason=f"verification after {step.agent}",
+                )
+                if verifier_exec:
+                    executions.append(verifier_exec)
 
             # Generic self-review-and-refine loop for Python code generation
             if step.agent == "python" and not isinstance(agent_model, DummyModel):
@@ -195,9 +237,345 @@ class MultiAgentOrchestrator:
                 )
             )
 
-        final_result = self._finalize(task, executions)
+        final_result = self._finalize(task, executions, project_summary=project_summary)
         self.logger.on_final(final_result)
         return OrchestrationResult(final=final_result, steps=executions)
+
+    def _ensure_project_plan(self, task: str, plan: List[PlanStep]) -> List[PlanStep]:
+        if any(step.agent == "project_architect" for step in plan):
+            return plan
+        if not self._looks_like_project_request(task):
+            return plan
+        return [
+            PlanStep(
+                agent="project_architect",
+                instruction=task,
+                reason="auto project generation",
+            )
+        ]
+
+    def _execute_project_plan(
+        self,
+        *,
+        architect_output: AgentResult,
+        original_task: str,
+        base_directory: Path | None,
+    ) -> Tuple[List[StepExecution], AgentResult | None]:
+        text = (architect_output.text or "").strip()
+        if not text:
+            raise RuntimeError("project architect produced empty plan")
+        try:
+            spec = ProjectSpec.from_json(text)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid project plan: {exc}") from exc
+
+        if not spec.files:
+            raise RuntimeError("project architect returned no files to generate")
+
+        project_root = self._allocate_project_root(spec, base_directory)
+        executions: List[StepExecution] = []
+        ready_files: List[str] = []
+
+        for file_spec in spec.files:
+            agent_name = select_agent_for_file(file_spec, spec)
+            agent_cls = AGENT_REGISTRY.get(agent_name)
+            if agent_cls is None:
+                raise RuntimeError(f"no agent registered for '{agent_name}' while generating {file_spec.path}")
+
+            factory = self.agent_model_factories.get(agent_name, self.model_factory)
+            agent_model = factory()
+            agent = agent_cls(agent_model)
+
+            instruction = build_instruction(file_spec, spec)
+            reason = f"project file: {file_spec.normalized_path}"
+            plan_context = format_plan_context_for_agent(agent_name, file_spec, spec, ready_files)
+            workspace_ctx = self._project_workspace_context(project_root, ready_files)
+            plan_step = PlanStep(agent=agent_name, instruction=instruction, reason=reason)
+
+            self.logger.on_agent_start(plan_step, instruction, plan_context)
+            try:
+                agent_result = agent.run(
+                    task=instruction,
+                    plan_context=plan_context,
+                    workspace=workspace_ctx,
+                )
+            except Exception as exc:  # pragma: no cover - pass through after logging
+                self.logger.on_agent_error(plan_step, exc)
+                raise
+
+            target_path = self._write_project_file(project_root, file_spec, agent_result.text)
+            rel_display = self._relative_display(target_path, base_directory)
+            stored_result = AgentResult(text=agent_result.text, filename=str(rel_display))
+            self.logger.on_agent_end(plan_step, stored_result)
+            executions.append(StepExecution(step=plan_step, result=stored_result))
+            ready_files.append(file_spec.normalized_path)
+
+            verifier_exec = self._invoke_verifier(
+                task=f"Syntax check for {file_spec.normalized_path}",
+                code=stored_result.text,
+                reason=f"syntax check for {file_spec.normalized_path}",
+                filename=str(target_path),
+                mode="syntax",
+            )
+            if verifier_exec:
+                executions.append(verifier_exec)
+
+        env_step, env_message = self._maybe_create_uv_environment(spec, project_root)
+        if env_step:
+            executions.append(env_step)
+
+        runtime_step, runtime_message = self._maybe_run_project_runtime(
+            spec,
+            project_root,
+            original_task,
+        )
+        if runtime_step:
+            executions.append(runtime_step)
+
+        summary_lines: List[str] = []
+        display_root = self._relative_display(project_root, base_directory)
+        summary_lines.append(summarize_created_files(display_root, spec.files))
+        project_description = spec.describe()
+        if project_description:
+            summary_lines.append("")
+            summary_lines.append(project_description)
+        if env_message:
+            summary_lines.append("")
+            summary_lines.append(env_message)
+        if runtime_message:
+            summary_lines.append(runtime_message)
+
+        summary_text = "\n".join(line for line in summary_lines if line is not None)
+        summary_result = AgentResult(text=summary_text.strip()) if summary_text.strip() else None
+        return executions, summary_result
+
+    def _allocate_project_root(self, project: ProjectSpec, base: Path | None) -> Path:
+        base_dir = (base or Path.cwd()).resolve()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        candidate = base_dir / project.slug
+        if not candidate.exists():
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        for idx in itertools.count(2):
+            alt = base_dir / f"{project.slug}-{idx}"
+            if not alt.exists():
+                alt.mkdir(parents=True, exist_ok=True)
+                return alt
+        raise RuntimeError("unable to allocate unique project directory")
+
+    def _project_workspace_context(
+        self,
+        project_root: Path,
+        ready_files: Sequence[str],
+        *,
+        max_files: int = 5,
+        max_bytes: int = 800,
+    ) -> str:
+        if not ready_files:
+            return ""
+        lines: List[str] = []
+        for rel in list(ready_files)[-max_files:]:
+            path = project_root / rel
+            if not path.exists() or not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except (OSError, UnicodeDecodeError):
+                continue
+            snippet = text[:max_bytes].rstrip()
+            if not snippet:
+                continue
+            lines.append(f"--- {rel} ---")
+            lines.append(snippet)
+        return "\n".join(lines).strip()
+
+    def _write_project_file(
+        self,
+        project_root: Path,
+        file_spec: ProjectFileSpec,
+        content: str,
+    ) -> Path:
+        root_resolved = project_root.resolve()
+        relative = Path(file_spec.normalized_path)
+        target = (root_resolved / relative).resolve()
+        try:
+            target.relative_to(root_resolved)
+        except ValueError as exc:
+            raise RuntimeError(f"file path {file_spec.normalized_path} escapes project root") from exc
+        ensure_directory(target)
+        text = content if content.endswith("\n") else content + "\n"
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def _relative_display(self, path: Path, base: Path | None) -> Path:
+        target = path.resolve()
+        if base is not None:
+            try:
+                return target.relative_to(base.resolve())
+            except ValueError:
+                pass
+        try:
+            return target.relative_to(Path.cwd())
+        except ValueError:
+            return target
+
+    def _looks_like_project_request(self, task: str) -> bool:
+        text = task.lower()
+        hints = [
+            "project",
+            "проект",
+            "pyproject",
+            "readme",
+            "package",
+            "init.py",
+            "src/",
+            "структур",
+            "каталог",
+            "module",
+        ]
+        return any(hint in text for hint in hints)
+
+    def _maybe_create_uv_environment(
+        self,
+        project: ProjectSpec,
+        project_root: Path,
+    ) -> Tuple[StepExecution | None, str | None]:
+        if project.language.strip().lower() != "python":
+            return None, None
+        uv_path = shutil.which("uv")
+        if not uv_path:
+            return None, "Skipped uv venv setup (uv executable not found)."
+        venv_dir = project_root / ".venv"
+        if venv_dir.exists():
+            return None, "Skipped uv venv setup (.venv already exists)."
+        step = PlanStep(agent="uv", instruction="uv venv .venv", reason="create project virtualenv")
+        self.logger.on_agent_start(step, step.instruction, "")
+        try:
+            completed = subprocess.run(  # nosec B603 B607 - intentional process execution
+                [uv_path, "venv", ".venv"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=180,
+                cwd=project_root,
+            )
+            stdout = completed.stdout.strip()
+            stderr = completed.stderr.strip()
+            if completed.returncode == 0:
+                summary = "uv venv .venv completed successfully"
+                if stdout:
+                    summary += f" (stdout: {stdout[:200]})"
+            else:
+                summary = f"uv venv .venv failed with code {completed.returncode}"
+                if stderr:
+                    summary += f" (stderr: {stderr[:200]})"
+        except subprocess.TimeoutExpired as exc:
+            summary = f"uv venv .venv timed out after {exc.timeout}s"
+        except OSError as exc:  # pragma: no cover - unlikely but defensive
+            summary = f"uv venv .venv failed: {exc}"
+        result = AgentResult(text=summary)
+        self.logger.on_agent_end(step, result)
+        return StepExecution(step=step, result=result), summary
+
+    def _discover_entrypoint(self, project_root: Path) -> str | None:
+        pyproject = project_root / "pyproject.toml"
+        if not pyproject.exists():
+            return None
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        project_data = data.get("project")
+        if not isinstance(project_data, dict):
+            return None
+        scripts = project_data.get("scripts")
+        if not isinstance(scripts, dict):
+            return None
+        for name, target in scripts.items():
+            if isinstance(name, str) and name.strip() and isinstance(target, str) and target.strip():
+                return name.strip()
+        return None
+
+    def _maybe_run_project_runtime(
+        self,
+        project: ProjectSpec,
+        project_root: Path,
+        original_task: str,
+    ) -> Tuple[StepExecution | None, str | None]:
+        entrypoint = self._discover_entrypoint(project_root)
+        if not entrypoint:
+            return None, "Runtime check skipped (no [project.scripts] entrypoint)."
+        verifier_exec = self._invoke_verifier(
+            task=f"Run project entrypoint {entrypoint}",
+            code="",
+            reason="project runtime verification",
+            filename=None,
+            mode="project_runtime",
+            project_meta={
+                "root": str(project_root),
+                "entrypoint": entrypoint,
+                "args": [],
+                "original_task": original_task,
+            },
+        )
+        if verifier_exec is None:
+            return None, "Runtime check skipped (verifier unavailable)."
+        verdict = self._parse_verifier_payload(verifier_exec.result.text)
+        ok_value = verdict.get("ok")
+        ok = bool(ok_value) if isinstance(ok_value, bool) else str(ok_value).lower() in {"true", "1", "yes"}
+        reason = str(verdict.get("reason") or "").strip()
+        if ok:
+            message = "Runtime check: OK"
+        else:
+            message = f"Runtime check failed: {reason or 'see verifier output'}"
+        return verifier_exec, message
+
+    @staticmethod
+    def _parse_verifier_payload(raw: str) -> dict:
+        text = (raw or "").strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        candidate = match.group(0) if match else text
+        try:
+            data = json.loads(candidate)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _invoke_verifier(
+        self,
+        *,
+        task: str,
+        code: str,
+        reason: str,
+        filename: str | None = None,
+        mode: str | None = None,
+        project_meta: dict | None = None,
+    ) -> StepExecution | None:
+        verifier_cls = AGENT_REGISTRY.get("verifier")
+        if verifier_cls is None:
+            return None
+
+        if (mode or "") != "project_runtime" and not (code or "").strip():
+            return None
+
+        factory = self.agent_model_factories.get("verifier")
+        if factory is None:
+            factory = self.planner_model_factory or self.model_factory
+        agent_model = factory()
+        verifier = verifier_cls(agent_model)
+        step = PlanStep(agent="verifier", instruction=task, reason=reason)
+        meta: dict = {}
+        if mode:
+            meta["mode"] = mode
+        if filename:
+            meta["filename"] = filename
+        if project_meta:
+            meta["project"] = project_meta
+        plan_context = json.dumps(meta, ensure_ascii=False) if meta else ""
+        self.logger.on_agent_start(step, task, plan_context)
+        verdict = verifier.run(task=task, plan_context=plan_context, workspace=code)
+        self.logger.on_agent_end(step, verdict)
+        return StepExecution(step=step, result=verdict)
 
     # --- Self-review and refinement for Python agent ---
 
@@ -214,9 +592,8 @@ class MultiAgentOrchestrator:
         if isinstance(reviewer_model, DummyModel):
             return []
 
-        verifier_agent_cls = AGENT_REGISTRY.get("verifier")
-        use_verifier = verifier_agent_cls is not None
-        if not use_verifier:
+        verifier_available = AGENT_REGISTRY.get("verifier") is not None
+        if not verifier_available:
             review_prompt = PromptTemplate.from_template(
                 (
                     "You are a strict code reviewer. Assess if the Python script fulfills the task.\n"
@@ -284,15 +661,17 @@ class MultiAgentOrchestrator:
                 code=current_result.text,
             )
 
-            if use_verifier:
-                agent_model = self.agent_model_factories.get("verifier", self.planner_model_factory or self.model_factory)()
-                verifier = verifier_agent_cls(agent_model)
-                step = PlanStep(agent="verifier", instruction=task, reason="code compliance check")
-                self.logger.on_agent_start(step, task, step.reason)
-                verdict = verifier.run(task=task, plan_context="", workspace=current_result.text)
-                self.logger.on_agent_end(step, verdict)
-                attempts.append(StepExecution(step=step, result=verdict))
-                outcome = _parse_review(verdict.text)
+            if verifier_available:
+                verifier_exec = self._invoke_verifier(
+                    task=task,
+                    code=current_result.text,
+                    reason="code compliance check",
+                )
+                if verifier_exec:
+                    attempts.append(verifier_exec)
+                    outcome = _parse_review(verifier_exec.result.text)
+                else:
+                    outcome = {"ok": False, "reason": "verifier unavailable", "missing": []}
             else:
                 if not audit_ok:
                     outcome = {"ok": False, "reason": audit_reason, "missing": audit_missing}
@@ -366,20 +745,20 @@ class MultiAgentOrchestrator:
             attempts.append(StepExecution(step=refined_step, result=refined_result))
             current_result = refined_result
 
-        if use_verifier:
+        if verifier_available:
             needs_final = True
             if attempts and attempts[-1].step.agent == "verifier":
                 parsed_last = _parse_review(attempts[-1].result.text)
                 if parsed_last.get("ok") is True:
                     needs_final = False
             if needs_final:
-                agent_model = self.agent_model_factories.get("verifier", self.planner_model_factory or self.model_factory)()
-                verifier = verifier_agent_cls(agent_model)
-                final_step = PlanStep(agent="verifier", instruction=task, reason="final verification")
-                self.logger.on_agent_start(final_step, task, final_step.reason)
-                verdict = verifier.run(task=task, plan_context="", workspace=current_result.text)
-                self.logger.on_agent_end(final_step, verdict)
-                attempts.append(StepExecution(step=final_step, result=verdict))
+                verifier_exec = self._invoke_verifier(
+                    task=task,
+                    code=current_result.text,
+                    reason="final verification",
+                )
+                if verifier_exec:
+                    attempts.append(verifier_exec)
 
         return attempts
     @staticmethod
@@ -425,7 +804,15 @@ class MultiAgentOrchestrator:
 
         return ordered
 
-    def _finalize(self, task: str, executions: Sequence[StepExecution]) -> AgentResult:
+    def _finalize(
+        self,
+        task: str,
+        executions: Sequence[StepExecution],
+        *,
+        project_summary: AgentResult | None = None,
+    ) -> AgentResult:
+        if project_summary is not None:
+            return project_summary
         if len(executions) == 1:
             return executions[0].result
 
@@ -448,15 +835,29 @@ class MultiAgentOrchestrator:
                 break
 
         if last_verifier_idx is not None:
-            verifier_result = executions[last_verifier_idx].result
+            verifier_exec = executions[last_verifier_idx]
+            verifier_result = verifier_exec.result
             verdict = _parse_verdict(verifier_result.text)
-            if verdict.get("ok") is True:
-                for j in range(last_verifier_idx - 1, -1, -1):
-                    if executions[j].step.agent == "python":
-                        python_result = executions[j].result
-                        if python_result.filename:
-                            return AgentResult(text=python_result.text, filename=python_result.filename)
-                        return AgentResult(text=python_result.text)
+            candidate_result: AgentResult | None = None
+            for j in range(last_verifier_idx - 1, -1, -1):
+                if executions[j].step.agent == "verifier":
+                    continue
+                candidate_result = executions[j].result
+                break
+
+            if verdict.get("ok") is True and candidate_result is not None:
+                if candidate_result.filename:
+                    return AgentResult(text=candidate_result.text, filename=candidate_result.filename)
+                return AgentResult(text=candidate_result.text)
+
+            if candidate_result is not None:
+                combined = candidate_result.text
+                verifier_text = verifier_result.text.strip()
+                if verifier_text:
+                    suffix = f"\n\n[verifier]\n{verifier_text}"
+                    combined = combined.rstrip() + suffix
+                return AgentResult(text=combined, filename=candidate_result.filename)
+
             return AgentResult(text=verifier_result.text)
 
         for exec_step in reversed(executions):

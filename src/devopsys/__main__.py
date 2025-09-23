@@ -152,6 +152,11 @@ def cli_main(ctx: click.Context, backend: str, model: str, ollama_host: str) -> 
 @click.option("--print", "print_result", is_flag=True, default=True, help="Print to stdout")
 @click.option("--trace/--no-trace", default=True, help="Show step-by-step agent logs")
 @click.option("--ollama-host", "ollama_host_override", type=str, help="Override Ollama base URL")
+@click.option(
+    "--project-root",
+    type=click.Path(path_type=pathlib.Path),
+    help="Directory where generated project files will be created",
+)
 @click.pass_context
 def ask_cmd(
     ctx: click.Context,
@@ -166,6 +171,7 @@ def ask_cmd(
     print_result: bool,
     trace: bool,
     ollama_host_override: str | None,
+    project_root: pathlib.Path | None,
 ) -> None:
     """Распознаёт задачу и вызывает нужного агента."""
     text = " ".join(task).strip()
@@ -200,7 +206,12 @@ def ask_cmd(
         agent_model_factories=agent_factories or None,
     )
     try:
-        result = orchestrator.execute(text, forced_agent=agent, os_name=os_name)
+        result = orchestrator.execute(
+            text,
+            forced_agent=agent,
+            os_name=os_name,
+            project_root=project_root,
+        )
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
 

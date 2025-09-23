@@ -3,7 +3,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-AgentName = Literal["docker", "python", "rust", "bash", "linux"]
+AgentName = Literal["docker", "python", "rust", "bash", "linux", "project_architect"]
 
 KEYWORDS = {
     "docker": [r"\bdockerfile\b", r"\bdocker\b", r"container\b"],
@@ -24,6 +24,18 @@ KEYWORDS = {
         r"запуск|запусти|старт",
     ],
     "linux": [r"\bubuntu\b", r"\barch\b", r"linux\b", r"apt\b|pacman\b|systemd\b"],
+    "project_architect": [
+        r"\bproject\b",
+        r"\bscaffold\b",
+        r"\bstructure\b",
+        r"pyproject\.toml",
+        r"readme\.md",
+        r"\bmodule\b",
+        r"\bsrc\b",
+        r"проект",
+        r"структур",
+        r"каталог",
+    ],
 }
 
 @dataclass
