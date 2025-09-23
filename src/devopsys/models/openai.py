@@ -8,7 +8,7 @@ from .base import Model
 class OpenAIModel(Model):
     def __init__(
         self,
-        api_key: str,
+        api_key: str | None,
         model: str,
         *,
         base_url: str | None = None,
@@ -17,21 +17,19 @@ class OpenAIModel(Model):
         timeout: float = 120.0,
         system_prompt: str | None = None,
     ) -> None:
-        if not api_key:
-            raise ValueError("OpenAIModel requires an API key")
-        self.api_key = api_key
+        self.api_key = api_key.strip() if api_key else None
         self.model = model
         self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+        self.host = self.base_url
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
         self.system_prompt = system_prompt or "You are a helpful coding assistant."
 
     async def acomplete(self, prompt: str) -> str:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         payload = {
             "model": self.model,
             "temperature": self.temperature,

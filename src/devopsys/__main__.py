@@ -51,16 +51,17 @@ def _make_model_factory(
 
         return _factory
     if backend == "openai":
-        api_key = settings.openai_api_key.strip()
-        if not api_key:
-            raise click.ClickException("OpenAI backend requires DEVOPSYS_OPENAI_API_KEY")
         base_url = (settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+        raw_api_key = settings.openai_api_key
+        api_key = raw_api_key.strip() if raw_api_key else ""
+        if not api_key and base_url == "https://api.openai.com/v1":
+            raise click.ClickException("OpenAI backend requires DEVOPSYS_OPENAI_API_KEY")
         chosen_model = model_name or settings.openai_model
         system_prompt = settings.openai_system_prompt
 
         def _factory() -> Model:
             return OpenAIModel(
-                api_key=api_key,
+                api_key=api_key or None,
                 model=chosen_model,
                 base_url=base_url,
                 temperature=settings.temperature,

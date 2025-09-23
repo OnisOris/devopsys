@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List
 
-IGNORED_NAMES = {".git", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache"}
+IGNORED_NAMES = {".git", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache", "uv.lock"}
 
 
 def _iter_files(root: Path, max_files: int) -> Iterable[Path]:
@@ -27,7 +27,10 @@ def _iter_files(root: Path, max_files: int) -> Iterable[Path]:
                     break
 
 
-def build_workspace_snapshot(root: Path | None = None, max_files: int = 20, max_bytes: int = 2000) -> str:
+MAX_SNAPSHOT_CHARS = 4_000
+
+
+def build_workspace_snapshot(root: Path | None = None, max_files: int = 6, max_bytes: int = 600) -> str:
     root = (root or Path.cwd()).resolve()
     files = list(_iter_files(root, max_files))
 
@@ -56,4 +59,8 @@ def build_workspace_snapshot(root: Path | None = None, max_files: int = 20, max_
         lines.append(f"--- {rel} ---")
         lines.append(excerpt)
 
-    return "\n".join(lines).strip()
+    snapshot = "\n".join(lines).strip()
+    if len(snapshot) > MAX_SNAPSHOT_CHARS:
+        snapshot = snapshot[:MAX_SNAPSHOT_CHARS].rstrip()
+        snapshot += "\n[workspace snapshot truncated]"
+    return snapshot

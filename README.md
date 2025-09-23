@@ -53,6 +53,27 @@ uv run devopsys --ollama-host http://ollama:11434 ollama list
 uv run devopsys ask --ollama-host http://ollama:11434 --backend ollama --model codellama:7b-instruct "Dockerfile для FastAPI"
 ```
 
+## LM Studio и OpenAI-совместимые LLM
+
+LM Studio поднимает OpenAI-совместимый HTTP API, поэтому его можно использовать через бэкенд `openai`.
+
+1. Запустите LM Studio сервер и убедитесь, что эндпоинты доступны, например `http://10.10.3.193:1234/v1`.
+2. Добавьте переменные окружения (можно через `.env` в корне проекта):
+
+   ```bash
+   DEVOPSYS_OPENAI_BASE_URL=http://10.10.3.193:1234/v1
+   DEVOPSYS_OPENAI_MODEL=openai/gpt-oss-20b
+   # DEVOPSYS_OPENAI_API_KEY можно оставить пустым, если сервер не требует авторизации
+   ```
+
+3. Вызовите CLI с бэкендом `openai`:
+
+   ```bash
+   uv run devopsys ask --backend openai "Dockerfile для FastAPI"
+   ```
+
+Если используется публичный OpenAI или совместимые сервисы (OpenRouter, DeepSeek и т.п.), укажите ключ API через `DEVOPSYS_OPENAI_API_KEY`.
+
 ## Тесты
 
 ```bash
