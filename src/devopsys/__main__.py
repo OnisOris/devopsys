@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import pathlib
+import re
 import sys
-from typing import Callable
+from typing import Callable, Iterable
 
 import click
 import httpx
@@ -101,6 +103,48 @@ def _ensure_out_dir(path: str | None) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
+def _resolve_output_path(filename: str, base_dir: pathlib.Path | None) -> pathlib.Path:
+    path = pathlib.Path(filename)
+    if base_dir is not None:
+        base_resolved = base_dir.expanduser().resolve()
+    else:
+        base_resolved = None
+    if not path.is_absolute():
+        root = base_resolved or pathlib.Path.cwd()
+        path = root / path
+    path = path.expanduser().resolve()
+    if base_resolved is not None:
+        try:
+            path.relative_to(base_resolved)
+        except ValueError as exc:  # pragma: no cover - safety check
+            raise click.ClickException(
+                f"Output path {path} escapes project root {base_resolved}"
+            ) from exc
+    return path
+
+
+def _extract_verifier_outcome(steps: Iterable) -> dict | None:
+    def _parse(raw: str) -> dict | None:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        candidate = match.group(0) if match else text
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    for step in reversed(list(steps)):
+        if getattr(step.step, "agent", None) != "verifier":
+            continue
+        payload = _parse(step.result.text)
+        if payload is not None:
+            return payload
+    return None
+
+
 @click.group()
 @click.version_option()
 @click.option(
@@ -178,6 +222,17 @@ def ask_cmd(
     if not text:
         raise click.ClickException("Task is empty")
 
+    project_root_path: pathlib.Path | None = None
+    if project_root is not None:
+        try:
+            project_root_path = project_root.expanduser()
+            project_root_path.mkdir(parents=True, exist_ok=True)
+            project_root_path = project_root_path.resolve()
+        except OSError as exc:
+            raise click.ClickException(
+                f"Failed to prepare project root {project_root}: {exc}"
+            ) from exc
+
     backend_name: str = backend or ctx.obj["backend"]
     selected_model: str = model_name or ctx.obj["model"]
 
@@ -210,7 +265,7 @@ def ask_cmd(
             text,
             forced_agent=agent,
             os_name=os_name,
-            project_root=project_root,
+            project_root=project_root_path,
         )
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -227,9 +282,34 @@ def ask_cmd(
         pathlib.Path(out_path).write_text(res.text, encoding="utf-8")
         console.print(f"[green]Saved →[/green] {out_path}\n")
     elif res.filename:
-        _ensure_out_dir(res.filename)
-        pathlib.Path(res.filename).write_text(res.text, encoding="utf-8")
-        console.print(f"[green]Saved →[/green] {res.filename}\n")
+        target_path = _resolve_output_path(res.filename, project_root_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(res.text, encoding="utf-8")
+        res.filename = str(target_path)
+        display_path = target_path
+        if project_root_path is not None:
+            try:
+                display_path = target_path.relative_to(project_root_path)
+            except ValueError:
+                pass
+        console.print(f"[green]Saved →[/green] {display_path}\n")
+
+    verdict = _extract_verifier_outcome(result.steps)
+    if verdict is not None:
+        ok_value = verdict.get("ok")
+        ok = bool(ok_value) if isinstance(ok_value, bool) else str(ok_value).strip().lower() in {"true", "1", "yes"}
+        reason = str(verdict.get("reason") or "").strip()
+        missing_items = [str(item) for item in verdict.get("missing") or [] if item]
+        if ok:
+            console.print("[green]Verifier: OK[/green]")
+        else:
+            parts: list[str] = []
+            if reason:
+                parts.append(reason)
+            if missing_items:
+                parts.append("Missing: " + ", ".join(missing_items))
+            message = "; ".join(parts) if parts else "See verifier output above."
+            console.print(f"[yellow]Verifier issues:[/yellow] {message}")
 
     if print_result:
         sys.stdout.write(res.text + ("\n" if not res.text.endswith("\n") else ""))

@@ -1,4 +1,7 @@
 from __future__ import annotations
+
+import re
+
 from .base import Agent, AgentResult
 
 PROMPT = """
@@ -33,8 +36,23 @@ class DockerAgent(Agent):
     prompt_template = PROMPT
 
     def postprocess(self, text: str) -> AgentResult:
-        code = text.strip()
-        if code.startswith("```"):
-            code = code.strip("`\n")
-            code = "\n".join(line for line in code.splitlines() if not line.lower().startswith("dockerfile"))
-        return AgentResult(text=code, filename="Dockerfile")
+        raw = text.strip()
+        match = re.search(r"```(?:dockerfile)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
+        code = match.group(1) if match else raw
+        lines = code.splitlines()
+        cleaned: list[str] = []
+        started = False
+        for line in lines:
+            stripped = line.strip()
+            if not started:
+                if not stripped:
+                    continue
+                if stripped.startswith("#") or stripped.upper().startswith("FROM ") or stripped.upper().startswith("ARG "):
+                    started = True
+                else:
+                    continue
+            cleaned.append(line.rstrip())
+        final_code = "\n".join(cleaned).strip()
+        if not final_code:
+            final_code = code.strip()
+        return AgentResult(text=final_code, filename="Dockerfile")

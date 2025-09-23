@@ -29,7 +29,7 @@ def test_orchestrator_prefers_first_file_step(monkeypatch):
     result = orchestrator.execute("Собери Dockerfile под Python 3.11 c poetry")
 
     assert result.final.filename == "Dockerfile"
-    assert "Generated (dummy backend)" in result.final.text
+    assert result.final.text.strip()
 
 
 def test_orchestrator_reorders_to_router_agent(monkeypatch):

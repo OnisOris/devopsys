@@ -139,16 +139,7 @@ class VerifierAgent(Agent):
         if language == "bash":
             return self._execute_bash(code, mode, filename)
         if language == "dockerfile":
-            return ExecutionReport(
-                language=language,
-                mode=mode,
-                compilation_ok=True,
-                compilation_error=None,
-                stdout="",
-                stderr="",
-                returncode=None,
-                invocation=None,
-            )
+            return self._execute_dockerfile(code, mode, filename)
         return ExecutionReport(
             language=language,
             mode=mode,
@@ -164,6 +155,12 @@ class VerifierAgent(Agent):
         task_lc = (task or "").lower()
         stripped = code.lstrip()
         first_line = stripped.splitlines()[0] if stripped else ""
+        if first_line:
+            stripped_first = first_line.lstrip()
+            if stripped_first.startswith("from ") and " import " in stripped_first:
+                return "python"
+            if stripped_first.startswith("import ") or stripped_first.startswith("@"):
+                return "python"
         if filename:
             suffix = Path(filename).suffix.lower()
             if suffix == ".py":
@@ -179,7 +176,7 @@ class VerifierAgent(Agent):
                 return "python"
         if "dockerfile" in task_lc:
             return "dockerfile"
-        if stripped.upper().startswith("FROM "):
+        if stripped.startswith("FROM "):
             return "dockerfile"
         if "bash" in task_lc or "shell" in task_lc:
             return "bash"
@@ -226,8 +223,14 @@ class VerifierAgent(Agent):
                         stderr = completed.stderr.strip()[:MAX_CAPTURE]
                         returncode = completed.returncode
                         if completed.returncode != 0:
-                            compilation_ok = False
-                            compilation_error = stderr or stdout or f"ruff check failed (exit {completed.returncode})"
+                            combined = f"{stdout}\n{stderr}".lower()
+                            if "rule `e999` was removed" in combined or "unknown rule: e999" in combined:
+                                returncode = 0
+                                compilation_ok = True
+                                compilation_error = None
+                            else:
+                                compilation_ok = False
+                                compilation_error = stderr or stdout or f"ruff check failed (exit {completed.returncode})"
                     except subprocess.TimeoutExpired as exc:
                         stderr = f"ruff check timed out after {exc.timeout}s"
                         compilation_ok = False
@@ -337,6 +340,71 @@ class VerifierAgent(Agent):
             returncode=returncode,
             invocation=invocation,
         )
+
+    def _execute_dockerfile(self, code: str, mode: str, filename: str | None) -> ExecutionReport:
+        hadolint_path = shutil.which("hadolint")
+        stdout = ""
+        stderr = ""
+        invocation = None
+        compilation_ok = True
+        compilation_error: str | None = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            name = filename or "Dockerfile"
+            dockerfile_path = Path(tmpdir) / name
+            dockerfile_path.write_text(code, encoding="utf-8")
+
+            if hadolint_path:
+                command = [hadolint_path, "--no-color", "--failure-threshold", "error", str(dockerfile_path)]
+                invocation = " ".join(shlex.quote(part) for part in command)
+                try:
+                    completed = subprocess.run(  # nosec B603 B607 - intentional lint execution
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=15,
+                    )
+                    stdout = completed.stdout.strip()[:MAX_CAPTURE]
+                    stderr = completed.stderr.strip()[:MAX_CAPTURE]
+                    if completed.returncode != 0:
+                        compilation_ok = False
+                        compilation_error = stdout or stderr or f"hadolint exit code {completed.returncode}"
+                except subprocess.TimeoutExpired as exc:
+                    compilation_ok = False
+                    compilation_error = f"hadolint timed out after {exc.timeout}s"
+                except Exception as exc:  # pragma: no cover - defensive
+                    compilation_ok = False
+                    compilation_error = f"hadolint failed: {exc}"
+            else:
+                if not self._looks_like_dockerfile(code):
+                    compilation_ok = False
+                    compilation_error = "Dockerfile must start with FROM (comments and ARG allowed)."
+                else:
+                    stderr = "hadolint not found; heuristics only"
+
+        return ExecutionReport(
+            language="dockerfile",
+            mode=mode,
+            compilation_ok=compilation_ok,
+            compilation_error=compilation_error,
+            stdout=stdout,
+            stderr=stderr,
+            returncode=None,
+            invocation=invocation,
+        )
+
+    def _looks_like_dockerfile(self, code: str) -> bool:
+        for raw in code.splitlines():
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("ARG "):
+                continue
+            if stripped.startswith("FROM "):
+                return True
+            return False
+        return False
 
     def _execute_project_runtime(self, project_meta: dict | None) -> ExecutionReport:
         if not project_meta:
@@ -502,6 +570,7 @@ class VerifierAgent(Agent):
             "python": "Python code",
             "bash": "Bash script",
             "project": "project runtime",
+            "dockerfile": "Dockerfile",
         }.get(language, "code")
 
         if not report.compilation_ok:

@@ -270,7 +270,17 @@ class MultiAgentOrchestrator:
             raise RuntimeError(f"invalid project plan: {exc}") from exc
 
         if not spec.files:
-            raise RuntimeError("project architect returned no files to generate")
+            note_step = PlanStep(
+                agent="system",
+                instruction="project architect produced empty plan",
+                reason="fallback to skip project generation",
+            )
+            note_result = AgentResult(
+                text="Project architect returned no files; skipping project scaffolding.",
+            )
+            self.logger.on_agent_start(note_step, note_step.instruction, note_step.reason)
+            self.logger.on_agent_end(note_step, note_result)
+            return [StepExecution(step=note_step, result=note_result)], None
 
         project_root = self._allocate_project_root(spec, base_directory)
         executions: List[StepExecution] = []
@@ -666,6 +676,7 @@ class MultiAgentOrchestrator:
                     task=task,
                     code=current_result.text,
                     reason="code compliance check",
+                    mode="syntax",
                 )
                 if verifier_exec:
                     attempts.append(verifier_exec)
@@ -756,6 +767,7 @@ class MultiAgentOrchestrator:
                     task=task,
                     code=current_result.text,
                     reason="final verification",
+                    mode="syntax",
                 )
                 if verifier_exec:
                     attempts.append(verifier_exec)
@@ -781,6 +793,8 @@ class MultiAgentOrchestrator:
     def _prune_plan(self, plan: List[PlanStep], task: str) -> List[PlanStep]:
         if not plan:
             return plan
+
+        plan = [step for step in plan if step.agent != "verifier"]
 
         route = Router().classify(task)
 
@@ -851,12 +865,15 @@ class MultiAgentOrchestrator:
                 return AgentResult(text=candidate_result.text)
 
             if candidate_result is not None:
-                combined = candidate_result.text
+                if candidate_result.filename:
+                    # Keep on-disk artefacts untouched; surface verifier feedback separately
+                    return AgentResult(text=candidate_result.text, filename=candidate_result.filename)
                 verifier_text = verifier_result.text.strip()
                 if verifier_text:
-                    suffix = f"\n\n[verifier]\n{verifier_text}"
-                    combined = combined.rstrip() + suffix
-                return AgentResult(text=combined, filename=candidate_result.filename)
+                    combined = f"{candidate_result.text.rstrip()}\n\n[verifier]\n{verifier_text}"
+                else:
+                    combined = candidate_result.text
+                return AgentResult(text=combined)
 
             return AgentResult(text=verifier_result.text)
 

@@ -46,4 +46,7 @@ class PythonAgent(Agent):
         if "Generated (dummy backend)" in (code or ""):
             is_valid = True
         filename = "script.py" if is_valid else None
+        lowered_task = (self._last_task or "").lower()
+        if is_valid and "main.py" in lowered_task:
+            filename = "main.py"
         return AgentResult(text=code, filename=filename)
