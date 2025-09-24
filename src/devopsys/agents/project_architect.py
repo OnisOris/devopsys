@@ -4,6 +4,49 @@ import json
 import re
 from dataclasses import dataclass
 
+_CURLY_QUOTES = {
+    "“": '"',
+    "”": '"',
+    "„": '"',
+    "‟": '"',
+    "‟": '"',
+    "’": "'",
+    "‘": "'",
+}
+
+
+def _strip_code_fences(text: str) -> str:
+    if text.startswith("```"):
+        lines = text.splitlines()
+        try:
+            closing = next(i for i in range(len(lines) - 1, 0, -1) if lines[i].startswith("```"))
+            return "\n".join(lines[1:closing]).strip()
+        except StopIteration:
+            return "\n".join(lines[1:]).strip()
+    return text
+
+
+def _replace_curly_quotes(text: str) -> str:
+    for wrong, right in _CURLY_QUOTES.items():
+        text = text.replace(wrong, right)
+    return text
+
+
+def _strip_json_comments(text: str) -> str:
+    without_line = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    without_block = re.sub(r"/\*.*?\*/", "", without_line, flags=re.DOTALL)
+    return without_block
+
+
+def _remove_trailing_commas(text: str) -> str:
+    pattern = re.compile(r",(\s*[}\]])")
+    previous = None
+    current = text
+    while current != previous:
+        previous = current
+        current = pattern.sub(r"\1", current)
+    return current
+
 from .base import Agent, AgentResult
 
 PROMPT = """
@@ -46,6 +89,63 @@ class ParsedPlan:
     raw: str
 
 
+def _extract_plan_regex(text: str) -> dict:
+    result: dict[str, object] = {}
+
+    def _extract_str(source: str, pattern: str) -> str:
+        match = re.search(pattern, source, re.DOTALL)
+        return match.group(1).strip() if match else ""
+
+    name = _extract_str(text, r'"project_name"\s*:\s*"([^"]+)"')
+    if name:
+        result["project_name"] = name
+    language = _extract_str(text, r'"language"\s*:\s*"([^"]+)"')
+    if language:
+        result["language"] = language
+    summary = _extract_str(text, r'"summary"\s*:\s*"([^"]*)"')
+    if summary:
+        result["summary"] = summary
+
+    tasks_block = re.search(r'"tasks"\s*:\s*\[(.*?)\]', text, re.DOTALL)
+    if tasks_block:
+        tasks = [item.strip() for item in re.findall(r'"([^"]+)"', tasks_block.group(1)) if item.strip()]
+        if tasks:
+            result["tasks"] = tasks
+
+    files: list[dict[str, object]] = []
+    for match in re.finditer(r'\{[^{}]*?"path"\s*:\s*"[^"]+"[^{}]*?\}', text, re.DOTALL):
+        block = match.group(0)
+        cleaned = _remove_trailing_commas(_strip_json_comments(_replace_curly_quotes(block)))
+        try:
+            file_data = json.loads(cleaned)
+            if isinstance(file_data, dict) and file_data.get("path"):
+                files.append(file_data)
+                continue
+        except json.JSONDecodeError:
+            pass
+
+        path = _extract_str(block, r'"path"\s*:\s*"([^"]+)"')
+        if not path:
+            continue
+        entry: dict[str, object] = {"path": path}
+        goal = _extract_str(block, r'"goal"\s*:\s*"([^"]*)"')
+        if goal:
+            entry["goal"] = goal
+        agent = _extract_str(block, r'"agent"\s*:\s*"([^"]*)"')
+        if agent:
+            entry["agent"] = agent
+        req_block = re.search(r'"requirements"\s*:\s*\[(.*?)\]', block, re.DOTALL)
+        if req_block:
+            req_items = [item.strip() for item in re.findall(r'"([^"]+)"', req_block.group(1)) if item.strip()]
+            if req_items:
+                entry["requirements"] = req_items
+        files.append(entry)
+
+    if files:
+        result["files"] = files
+    return result
+
+
 class ProjectArchitectAgent(Agent):
     name = "project_architect"
     description = "Design multi-file project layouts"
@@ -59,24 +159,43 @@ class ProjectArchitectAgent(Agent):
         raw = (text or "").strip()
         if not raw:
             return {}
-        if raw.startswith("```"):
-            lines = raw.splitlines()
+
+        base = _strip_code_fences(raw)
+        base = _replace_curly_quotes(base)
+
+        candidates: list[str] = []
+        primary = base.strip()
+        if primary:
+            candidates.append(primary)
+        candidates.append(_strip_json_comments(primary))
+        candidates.append(_remove_trailing_commas(primary))
+        candidates.append(_remove_trailing_commas(_strip_json_comments(primary)))
+
+        data: dict | None = None
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if not candidate:
+                continue
             try:
-                closing = next(i for i in range(len(lines) - 1, 0, -1) if lines[i].startswith("```"))
-                raw = "\n".join(lines[1:closing]).strip()
-            except StopIteration:
-                raw = "\n".join(lines[1:]).strip()
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
+                data = json.loads(candidate)
+                if isinstance(data, dict):
+                    break
+            except json.JSONDecodeError:
+                match = re.search(r"\{.*\}", candidate, re.DOTALL)
+                if not match:
+                    continue
                 try:
-                    data = json.loads(match.group(0))
+                    data = json.loads(_remove_trailing_commas(match.group(0)))
+                    if isinstance(data, dict):
+                        break
                 except json.JSONDecodeError:
-                    data = {}
+                    continue
+        if not isinstance(data, dict) or not data.get("files"):
+            fallback = _extract_plan_regex(raw)
+            if fallback:
+                data = fallback
             else:
-                data = {}
+                data = {} if not isinstance(data, dict) else data
         if not isinstance(data, dict):
             return {}
         files = data.get("files")

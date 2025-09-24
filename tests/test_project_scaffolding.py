@@ -54,7 +54,12 @@ def project_plan() -> str:
             },
         ],
     }
-    return "Plan summary:\n```json\n" + json.dumps(plan) + "\n```\nThanks!"
+    base = json.dumps(plan, ensure_ascii=False, indent=2)
+    base = base.rstrip()
+    if base.endswith("}"):
+        base = base[:-1] + ",\n}"
+    noisy = "Plan summary:\n```json\n" + base + "\n``` // end of plan\nThanks!"
+    return noisy
 
 
 @pytest.fixture
